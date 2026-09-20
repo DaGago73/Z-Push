@@ -64,7 +64,7 @@ if (is_readable($configLocal)) {
 
 if (!defined('NCNOTES_URL')) {
     /** Nextcloud origin, no trailing slash. Docker: http://nextcloud */
-    define('NCNOTES_URL', 'https://www.primusnetz.de/nextcloud');
+    define('NCNOTES_URL', 'https://myhost/nextcloud');
 }
 if (!defined('NCNOTES_API')) {
     define('NCNOTES_API', '/index.php/apps/notes/api/v1');
