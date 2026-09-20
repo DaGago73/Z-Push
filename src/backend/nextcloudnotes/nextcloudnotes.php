@@ -37,12 +37,13 @@
  *   3. Set BACKEND_PROVIDER to BackendCombined (already the case
  *      if IMAP is combined with CalDAV/CardDAV).
  *
- *   4. Adjust the NCNOTES_* constants below, or define them earlier
- *      in config.php so these defaults are skipped.
+ *   4. Copy config.php next to it and set NCNOTES_URL. Do not put
+ *      secrets only in nextcloudnotes.php – updates overwrite that file.
  *
- * Auth: the ActiveSync username/password are sent as HTTP Basic to
- * Nextcloud. With 2FA, use a Nextcloud app password. Combined login
- * succeeds only if IMAP and this backend both accept the credentials.
+ * Auth: HTTP Basic against Nextcloud. Combined login does not require
+ * Nextcloud to accept the IMAP password (NCNOTES_REQUIRED defaults to
+ * false). If the device password is not a Nextcloud password, set
+ * NCNOTES_PASSWORD to an app password or Notes calls will 401.
  *
  * iOS: add the Exchange account and enable Notes. iOS does not sync
  * Nextcloud folders as separate EAS folders; all notes land in one
@@ -55,6 +56,11 @@
  * it under the terms of the GNU Affero General Public License, version 3,
  * as published by the Free Software Foundation.
  ***********************************************/
+
+$configLocal = dirname(__FILE__) . '/config.php';
+if (is_readable($configLocal)) {
+    require_once $configLocal;
+}
 
 if (!defined('NCNOTES_URL')) {
     /** Nextcloud origin, no trailing slash. Docker: http://nextcloud */
@@ -78,7 +84,11 @@ if (!defined('NCNOTES_PASSWORD')) {
     define('NCNOTES_PASSWORD', '');
 }
 if (!defined('NCNOTES_STRIP_DOMAIN')) {
-    define('NCNOTES_STRIP_DOMAIN', true);
+    define('NCNOTES_STRIP_DOMAIN', false);
+}
+if (!defined('NCNOTES_REQUIRED')) {
+    /** false = Combined/IMAP login still succeeds if Nextcloud auth fails */
+    define('NCNOTES_REQUIRED', false);
 }
 if (!defined('NCNOTES_VERIFY_SSL')) {
     define('NCNOTES_VERIFY_SSL', true);
@@ -87,7 +97,12 @@ if (!defined('NCNOTES_TIMEOUT')) {
     define('NCNOTES_TIMEOUT', 30);
 }
 if (!defined('NCNOTES_CHUNK_SIZE')) {
-    define('NCNOTES_CHUNK_SIZE', 100);
+    /** 0 = one unchunked list request (preferred; avoids API id-only stubs) */
+    define('NCNOTES_CHUNK_SIZE', 0);
+}
+if (!defined('NCNOTES_SINK_POLL')) {
+    /** Seconds between Nextcloud polls inside ChangesSink */
+    define('NCNOTES_SINK_POLL', 5);
 }
 
 class BackendNextcloudNotes extends BackendDiff {
@@ -116,48 +131,76 @@ class BackendNextcloudNotes extends BackendDiff {
     }
 
     /**
-     * Authenticate against Nextcloud with the same credentials the
-     * combined backend received from the device.
+     * Store credentials and probe Nextcloud.
+     *
+     * Combined backends fail the whole device login if any backend returns
+     * false. Notes must not take IMAP down: unless NCNOTES_REQUIRED is true,
+     * probe failures still return true (same idea as the old docker backend
+     * that ignored the password at Logon).
      */
     public function Logon($username, $domain, $password) {
-        $this->username = $this->mapUsername($username);
         $this->password = (NCNOTES_PASSWORD !== '') ? NCNOTES_PASSWORD : $password;
         $this->notesCache = null;
 
+        $candidates = array();
+        $mapped = $this->mapUsername($username);
+        $candidates[] = $mapped;
+        if ($username !== $mapped) {
+            $candidates[] = $username;
+        }
+        if ($domain !== '' && strpos($username, '@') === false) {
+            $candidates[] = $username . '@' . $domain;
+        }
+        $candidates = array_values(array_unique($candidates));
+        $this->username = $candidates[0];
+
         if (NCNOTES_URL === '' || NCNOTES_URL === 'https://nextcloud.example.com') {
-            ZLog::Write(LOGLEVEL_ERROR, 'BackendNextcloudNotes->Logon(): NCNOTES_URL is not configured');
-            return false;
+            ZLog::Write(LOGLEVEL_ERROR, 'BackendNextcloudNotes->Logon(): NCNOTES_URL is not configured (edit backend/nextcloudnotes/config.php)');
+            return $this->logonResult(false);
         }
 
-        $response = $this->api('GET', '/settings');
-        if ($response === false) {
-            // Notes < 4.1 has no settings endpoint; fall back to an empty list call.
-            $response = $this->api('GET', '/notes?exclude=content&chunkSize=1');
-        }
-
-        if ($response === false || $response['status'] === 401 || $response['status'] === 403) {
-            ZLog::Write(LOGLEVEL_WARN, sprintf(
-                "BackendNextcloudNotes->Logon(): Nextcloud auth failed for '%s' (HTTP %s)",
-                $this->username,
-                $response === false ? 'n/a' : $response['status']
+        $lastStatus = 'n/a';
+        foreach ($candidates as $candidate) {
+            $this->username = $candidate;
+            $response = $this->probeNotes();
+            if ($response !== false && $response['status'] >= 200 && $response['status'] < 300) {
+                ZLog::Write(LOGLEVEL_DEBUG, sprintf(
+                    "BackendNextcloudNotes->Logon(): authenticated as '%s' on '%s'",
+                    $this->username,
+                    NCNOTES_URL
+                ));
+                return true;
+            }
+            $lastStatus = ($response === false) ? 'n/a' : (string)$response['status'];
+            ZLog::Write(LOGLEVEL_DEBUG, sprintf(
+                "BackendNextcloudNotes->Logon(): probe as '%s' -> HTTP %s",
+                $candidate,
+                $lastStatus
             ));
-            return false;
         }
 
-        if ($response['status'] < 200 || $response['status'] >= 300) {
-            ZLog::Write(LOGLEVEL_WARN, sprintf(
-                "BackendNextcloudNotes->Logon(): unexpected HTTP %d from Nextcloud",
-                $response['status']
-            ));
-            return false;
-        }
-
-        ZLog::Write(LOGLEVEL_DEBUG, sprintf(
-            "BackendNextcloudNotes->Logon(): authenticated as '%s' on '%s'",
+        $this->username = $candidates[0];
+        ZLog::Write(LOGLEVEL_WARN, sprintf(
+            "BackendNextcloudNotes->Logon(): Nextcloud probe failed for '%s' (HTTP %s). IMAP login continues unless NCNOTES_REQUIRED is true.",
             $this->username,
-            NCNOTES_URL
+            $lastStatus
         ));
-        return true;
+        return $this->logonResult(false);
+    }
+
+    /**
+     * Lightweight auth/connectivity check. Do not use /settings: older Notes
+     * apps return 400, which used to fail Combined login on iOS.
+     */
+    private function probeNotes() {
+        return $this->api('GET', '/notes?exclude=content&chunkSize=1');
+    }
+
+    private function logonResult($ok) {
+        if ($ok) {
+            return true;
+        }
+        return NCNOTES_REQUIRED ? false : true;
     }
 
     public function Logoff() {
@@ -238,11 +281,15 @@ class BackendNextcloudNotes extends BackendDiff {
             return array();
         }
 
+        $notes = $this->listNotesMeta();
+        if ($notes === false) {
+            return false;
+        }
+
+        // Notes are not mail: never drop items via cutoffdate. DiffEngine must
+        // see the full id set or it treats missing notes as deletes.
         $messages = array();
-        foreach ($this->listNotesMeta() as $note) {
-            if ($cutoffdate > 0 && isset($note['modified']) && (int)$note['modified'] < (int)$cutoffdate) {
-                continue;
-            }
+        foreach ($notes as $note) {
             $stat = $this->statFromNote($note);
             if ($stat !== false) {
                 $messages[] = $stat;
@@ -304,9 +351,12 @@ class BackendNextcloudNotes extends BackendDiff {
             return false;
         }
 
-        foreach ($this->listNotesMeta() as $note) {
-            if ((string)$note['id'] === (string)$id) {
-                return $this->statFromNote($note);
+        $notes = $this->listNotesMeta();
+        if (is_array($notes)) {
+            foreach ($notes as $note) {
+                if ((string)$note['id'] === (string)$id) {
+                    return $this->statFromNote($note);
+                }
             }
         }
 
@@ -421,43 +471,57 @@ class BackendNextcloudNotes extends BackendDiff {
             return false;
         }
 
+        // Only register the folder. Baseline is taken on the first ChangesSink
+        // poll (same pattern as BackendIMAP) so we do not snapshot "already
+        // changed" state and then miss it for the rest of this Ping.
         $this->sinkfolders[$folderid] = true;
-        $this->sinkstate[$folderid] = $this->notesFingerprint();
         $this->changessinkinit = true;
         return true;
     }
 
     /**
-     * Poll Nextcloud once, then block until timeout if nothing changed.
-     * Returns folder ids that need a sync (combined backend expects this).
+     * Poll Nextcloud until $timeout. Combined splits this timeout across
+     * sink backends, so re-check every NCNOTES_SINK_POLL seconds instead of
+     * sleeping the whole slice after a single GET.
+     *
+     * @return array folder ids that need a sync
      */
     public function ChangesSink($timeout = 30) {
         $notifications = array();
-        $stopat = time() + $timeout - 1;
+        $stopat = time() + max(1, (int)$timeout) - 1;
+        $poll = max(1, (int)NCNOTES_SINK_POLL);
 
         if (!$this->changessinkinit) {
-            sleep($timeout);
+            sleep(max(1, (int)$timeout));
             return $notifications;
         }
 
-        $this->notesCache = null;
-        foreach (array_keys($this->sinkfolders) as $folderid) {
-            $fingerprint = $this->notesFingerprint();
-            if (!isset($this->sinkstate[$folderid])) {
-                $this->sinkstate[$folderid] = $fingerprint;
-                continue;
+        do {
+            $this->notesCache = null;
+            foreach (array_keys($this->sinkfolders) as $folderid) {
+                $fingerprint = $this->notesFingerprint();
+                if ($fingerprint === false) {
+                    continue;
+                }
+                if (!isset($this->sinkstate[$folderid])) {
+                    $this->sinkstate[$folderid] = $fingerprint;
+                    continue;
+                }
+                if ($fingerprint !== $this->sinkstate[$folderid]) {
+                    $this->sinkstate[$folderid] = $fingerprint;
+                    $notifications[] = $folderid;
+                }
             }
-            if ($fingerprint !== $this->sinkstate[$folderid]) {
-                $this->sinkstate[$folderid] = $fingerprint;
-                $notifications[] = $folderid;
-            }
-        }
 
-        if (empty($notifications)) {
-            while ($stopat > time()) {
-                sleep(1);
+            if (!empty($notifications)) {
+                return array_values(array_unique($notifications));
             }
-        }
+
+            $remaining = $stopat - time();
+            if ($remaining > 0) {
+                sleep(min($poll, $remaining));
+            }
+        } while (time() < $stopat);
 
         return $notifications;
     }
@@ -466,6 +530,15 @@ class BackendNextcloudNotes extends BackendDiff {
     // Nextcloud API
     // ------------------------------------------------------------------
 
+    /**
+     * Full note metadata (no content). Returns false on API failure so
+     * DiffEngine does not treat a failed list as "all notes deleted".
+     *
+     * The Notes API appends id-only stubs on the last chunk (prune placeholders).
+     * Those must not overwrite real etag/modified values.
+     *
+     * @return array|false
+     */
     private function listNotesMeta() {
         if (is_array($this->notesCache)) {
             return $this->notesCache;
@@ -477,8 +550,10 @@ class BackendNextcloudNotes extends BackendDiff {
         do {
             $query = array(
                 'exclude' => 'content',
-                'chunkSize' => (int)NCNOTES_CHUNK_SIZE,
             );
+            if ((int)NCNOTES_CHUNK_SIZE > 0) {
+                $query['chunkSize'] = (int)NCNOTES_CHUNK_SIZE;
+            }
             if ($cursor !== null && $cursor !== '') {
                 $query['chunkCursor'] = $cursor;
             }
@@ -486,14 +561,17 @@ class BackendNextcloudNotes extends BackendDiff {
             $response = $this->api('GET', '/notes?' . http_build_query($query));
             if ($response === false || $response['status'] < 200 || $response['status'] >= 300 || !is_array($response['json'])) {
                 ZLog::Write(LOGLEVEL_WARN, 'BackendNextcloudNotes->listNotesMeta(): list failed');
-                $this->notesCache = array();
-                return $this->notesCache;
+                return false;
             }
 
             foreach ($response['json'] as $note) {
-                if (is_array($note) && isset($note['id'])) {
-                    $notes[(string)$note['id']] = $note;
+                if (!is_array($note) || !isset($note['id'])) {
+                    continue;
                 }
+                if ($this->isPrunedNote($note)) {
+                    continue;
+                }
+                $notes[(string)$note['id']] = $note;
             }
 
             $cursor = $this->headerValue($response['headers'], 'x-notes-chunk-cursor');
@@ -514,17 +592,22 @@ class BackendNextcloudNotes extends BackendDiff {
         return $response['json'];
     }
 
+    /**
+     * @return string|false
+     */
     private function notesFingerprint() {
+        $notes = $this->listNotesMeta();
+        if ($notes === false) {
+            return false;
+        }
+
         $parts = array();
-        foreach ($this->listNotesMeta() as $note) {
-            $rev = '';
-            if (isset($note['etag']) && $note['etag'] !== '') {
-                $rev = (string)$note['etag'];
+        foreach ($notes as $note) {
+            $stat = $this->statFromNote($note);
+            if ($stat === false) {
+                continue;
             }
-            elseif (isset($note['modified'])) {
-                $rev = (string)$note['modified'];
-            }
-            $parts[] = $note['id'] . ':' . $rev;
+            $parts[] = $stat['id'] . ':' . $stat['mod'];
         }
         sort($parts);
         return sha1(implode('|', $parts));
@@ -562,6 +645,8 @@ class BackendNextcloudNotes extends BackendDiff {
             CURLOPT_SSL_VERIFYHOST => NCNOTES_VERIFY_SSL ? 2 : 0,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_USERAGENT => 'Z-Push-NextcloudNotes',
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
         );
         if ($body !== null) {
             $opts[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_UNICODE);
@@ -628,12 +713,11 @@ class BackendNextcloudNotes extends BackendDiff {
             return false;
         }
 
-        $mod = '';
-        if (isset($note['etag']) && $note['etag'] !== '') {
-            $mod = (string)$note['etag'];
-        }
-        elseif (isset($note['modified'])) {
-            $mod = (string)$note['modified'];
+        $etag = (isset($note['etag']) && $note['etag'] !== '') ? (string)$note['etag'] : '';
+        $modified = isset($note['modified']) ? (string)$note['modified'] : '';
+        $mod = $etag . ':' . $modified;
+        if ($mod === ':') {
+            $mod = 'id:' . $note['id'];
         }
 
         return array(
@@ -641,6 +725,18 @@ class BackendNextcloudNotes extends BackendDiff {
             'mod' => $mod,
             'flags' => 1,
         );
+    }
+
+    /**
+     * Last-chunk prune placeholders from the Notes API: only `id` is set.
+     */
+    private function isPrunedNote(array $note) {
+        if (!isset($note['id'])) {
+            return true;
+        }
+        $hasRev = (isset($note['etag']) && $note['etag'] !== '')
+            || (isset($note['modified']) && $note['modified'] !== '' && $note['modified'] !== null);
+        return !$hasRev;
     }
 
     private function easCategoriesFromNote(array $note) {
